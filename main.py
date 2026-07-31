@@ -2,6 +2,7 @@ import os
 import random
 import re
 import logging
+import asyncio
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, error
@@ -41,13 +42,22 @@ RAW_WORDS = [
     "GAME", "FOUR", "FIRE", "WORD", "PLAY", "CODE", "RUNS", "STOP", "LOOK", "CALL", "BACK", "BEST", "FAST", "SLOW", "HIGH", "LOWS", 
     "OPEN", "CLOS", "READ", "WRIT", "BOOK", "PAGE", "LINE", "JUMP", "WALK", "TALK", "QUIZ", "TEST", "RAIN", "SNOW", "SUNY", "COLD", 
     "HEAT", "WIND", "MIST", "DUST", "ROCK", "SAND", "SOIL", "GRAS", "TREE", "LEAF", "ROOT", "STEM", "SEED", "GROW", "CROP", "FARM", 
+    "BLUE", "PINK", "GOLD", "IRON", "COAL", "MINE", "RICH", "POOR", "WAVE", "FISH", "BIRD", "LION", "BEAR", "WOLF", "DEER", "DUCK",
+    "FROG", "CRAB", "STAR", "MOON", "PLAN", "TIME", "HOUR", "DATE", "YEAR", "MIND", "SOUL", "LIFE", "DEAD", "BORN", "BABY", "KIDS",
+    "TEAM", "GOAL", "WINS", "LOSS", "ZONE", "ROSE", "WIND", "SHIP", "BOAT", "CITY", "TOWN", "LAND", "KING", "WISH", "HOPE", "LOVE",
     # 5-Letter Words
     "APPLE", "HEART", "WATER", "TABLE", "PLANT", "TIGER", "EAGLE", "SNAKE", "WHALE", "ZEBRA", "SOUND", "MUSIC", "RADIO", "VOICE", 
     "BEACH", "OCEAN", "RIVER", "LAKE", "FIELD", "CABLE", "WIRED", "PHONE", "EMAIL", "SCARY", "HAPPY", "FUNNY", "SADLY", "ANGER", 
     "BRAVE", "CHAIR", "BENCH", "CUPPY", "GLASS", "PLATE", "FORKS", "KNIFE", "SPOON", "SUGAR", "SALTZ", "BREAD", "CHEES", "MEATS", 
+    "SHARK", "CLOUD", "STORM", "LIGHT", "NIGHT", "CLOCK", "WATCH", "SMART", "SWEET", "SHARP", "ROUND", "GREEN", "WHITE", "BLACK",
+    "BROWN", "HOUSE", "PLACE", "WORLD", "SPACE", "TRAIN", "PLANE", "MOTOR", "WHEEL", "BRUSH", "PAINT", "PAPER", "WRITE", "PRINT",
+    "DREAM", "SLEEP", "SMILE", "LAUGH", "STONE", "BRICK", "STARS", "FLAME", "LIGHT", "MATCH", "FIGHT", "CROWN", "MAGIC", "FRUIT",
     # 8-Letter Words
     "FOOTBALL", "COMPUTER", "KEYBOARD", "MEMORIZE", "INTERNET", "PROGRAMS", "SOFTWARE", "HARDWARE", "DATABASE", "ALGORISM", 
     "SECURITY", "PASSWORD", "TELEGRAM", "BUSINESS", "FINANCES", "MARKETIN", "ADVERTSZ", "STRATEGY", "MANUFACT", "PRODUCTS", 
+    "CHAMPION", "CREATIVE", "DESIGNER", "DOCUMENT", "ENGINEER", "FEEDBACK", "FESTIVAL", "FORECAST", "FRIENDLY", "GARDENER",
+    "HOSPITAL", "IDENTITY", "INDUSTRY", "LANGUAGE", "MOUNTAIN", "NAVIGATE", "PERSONAL", "PLATFORM", "POSITION", "QUESTION",
+    "REACTION", "STRENGTH", "UNIVERSE", "VALUABLE", "PRACTICE"
 ]
 
 WORDS_BY_LENGTH: Dict[int, List[str]] = {}
@@ -59,7 +69,7 @@ for word in RAW_WORDS:
          
 # --- MongoDB Manager Class (Unchanged from your last version) ---
 class MongoDBManager:
-    """Handles all interactions with MongoDB, now with time-based leaderboards."""
+    """Handles all interactions with MongoDB, now with time-based leaderboards and clone support."""
     def __init__(self, mongo_url: str, db_name: str):
         if not mongo_url:
             raise ValueError("MONGO_URL not provided.")
@@ -71,8 +81,20 @@ class MongoDBManager:
         self.chats_collection = self.db['known_chats'] 
         
         self.leaderboard_collection.create_index("user_id", unique=True)
-        self.games_collection.create_index("chat_id", unique=True)
-        self.chats_collection.create_index("chat_id", unique=True)
+
+        # Drop old single chat_id unique indexes if they exist
+        try:
+            self.games_collection.drop_index("chat_id_1")
+        except Exception:
+            pass
+        try:
+            self.chats_collection.drop_index("chat_id_1")
+        except Exception:
+            pass
+
+        # Create new unique compound indexes partitioned by bot_username
+        self.games_collection.create_index([("chat_id", 1), ("bot_username", 1)], unique=True)
+        self.chats_collection.create_index([("chat_id", 1), ("bot_username", 1)], unique=True)
         logger.info("✅ MongoDB connection and indexing successful.")
 
     def _get_reset_check_query(self, user_id: int, period: str) -> dict:
@@ -158,29 +180,68 @@ class MongoDBManager:
         result.sort(key=lambda x: x[1], reverse=True)
         return result[:limit]
 
-    def get_game_state(self, chat_id: int) -> Dict | None:
-        return self.games_collection.find_one({'chat_id': chat_id})
+    def get_game_state(self, chat_id: int, bot_username: str) -> Dict | None:
+        return self.games_collection.find_one({'chat_id': chat_id, 'bot_username': bot_username.lower()})
 
-    def save_game_state(self, chat_id: int, state: Dict):
-        state_to_save = {'chat_id': chat_id, **state}
+    def save_game_state(self, chat_id: int, state: Dict, bot_username: str):
+        state_to_save = {'chat_id': chat_id, 'bot_username': bot_username.lower(), **state}
         self.games_collection.replace_one(
-            {'chat_id': chat_id}, 
+            {'chat_id': chat_id, 'bot_username': bot_username.lower()},
             state_to_save, 
             upsert=True
         )
 
-    def delete_game_state(self, chat_id: int):
-        self.games_collection.delete_one({'chat_id': chat_id})
+    def delete_game_state(self, chat_id: int, bot_username: str):
+        self.games_collection.delete_one({'chat_id': chat_id, 'bot_username': bot_username.lower()})
 
-    def add_chat(self, chat_id: int, chat_type: str, date: float):
+    def add_chat(self, chat_id: int, chat_type: str, date: float, bot_username: str):
         self.chats_collection.update_one(
-            {'chat_id': chat_id},
+            {'chat_id': chat_id, 'bot_username': bot_username.lower()},
             {'$set': {'chat_type': chat_type, 'last_active': date}},
             upsert=True
         )
 
-    def get_all_chat_ids(self) -> List[int]:
-        return [doc['chat_id'] for doc in self.chats_collection.find({}, {'chat_id': 1})]
+    def get_all_chats(self, bot_username: str = None) -> List[dict]:
+        if bot_username:
+            return list(self.chats_collection.find({'bot_username': bot_username.lower()}))
+        return list(self.chats_collection.find())
+
+    # --- Clone Management DB Methods ---
+    def save_clone(self, user_id: int, username: str, token: str, bot_username: str):
+        self.db['cloned_bots'].update_one(
+            {'user_id': user_id},
+            {
+                '$set': {
+                    'username': username,
+                    'token': token,
+                    'bot_username': bot_username.lower(),
+                    'is_active': True,
+                    'created_at': datetime.now(timezone.utc)
+                }
+            },
+            upsert=True
+        )
+
+    def get_clone_by_owner(self, user_id: int) -> dict | None:
+        return self.db['cloned_bots'].find_one({'user_id': user_id})
+
+    def get_clone_by_username(self, bot_username: str) -> dict | None:
+        return self.db['cloned_bots'].find_one({'bot_username': bot_username.lower()})
+
+    def delete_clone(self, user_id: int):
+        self.db['cloned_bots'].delete_one({'user_id': user_id})
+
+    def get_all_clones(self) -> List[dict]:
+        return list(self.db['cloned_bots'].find())
+
+    def update_clone_links(self, user_id: int, custom_channel: str = None, custom_group: str = None):
+        update_fields = {}
+        if custom_channel is not None:
+            update_fields['custom_channel'] = custom_channel
+        if custom_group is not None:
+            update_fields['custom_group'] = custom_group
+        if update_fields:
+            self.db['cloned_bots'].update_one({'user_id': user_id}, {'$set': update_fields})
 
 # --- Initialize MongoDB Manager ---
 mongo_manager = None
@@ -192,6 +253,111 @@ try:
 except Exception as e:
     logger.error(f"❌ FATAL: Could not connect to MongoDB. Error: {e}")
     mongo_manager = None 
+
+# --- Clone Manager Class ---
+class CloneManager:
+    """Manages the lifecycle of cloned bots concurrently in the same asyncio event loop."""
+    def __init__(self, db_manager):
+        self.db = db_manager
+        self.clones: Dict[str, Application] = {}  # token -> Application
+        self.clones_by_username: Dict[str, Application] = {}  # bot_username -> Application
+
+    async def start_clone(self, token: str, owner_id: int) -> Tuple[bool, str]:
+        token = token.strip()
+        if not token:
+            return False, "Token cannot be empty."
+
+        # 1. Validate token with Telegram
+        try:
+            from telegram import Bot
+            temp_bot = Bot(token)
+            me = await temp_bot.get_me()
+            bot_username = me.username.lower()
+        except Exception as e:
+            logger.error(f"Failed to validate token {token[:10]}...: {e}")
+            return False, f"Invalid token or Telegram connection error: {e}"
+
+        # If the owner already has a clone running, stop it first to prevent memory leak and cleanly replace it!
+        if self.db:
+            existing = self.db.get_clone_by_owner(owner_id)
+            if existing:
+                existing_token = existing.get("token")
+                if existing_token:
+                    await self.stop_clone(existing_token)
+
+        # Also stop by token directly if token is already in memory
+        if token in self.clones:
+            await self.stop_clone(token)
+
+        # 2. Create Application
+        try:
+            builder = Application.builder().token(token)
+            builder.signals(None) # Disable signal handling for clones to avoid conflict with main process
+            app = builder.build()
+
+            # Register handlers to the clone app
+            register_all_handlers(app)
+
+            # Initialize, start, and start polling
+            await app.initialize()
+            await app.start()
+            await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+
+            self.clones[token] = app
+            self.clones_by_username[bot_username] = app
+            logger.info(f"Successfully started cloned bot: @{bot_username}")
+            return True, bot_username
+        except Exception as e:
+            logger.error(f"Error starting clone @{bot_username}: {e}")
+            return False, str(e)
+
+    async def stop_clone(self, token: str) -> bool:
+        token = token.strip()
+        if token in self.clones:
+            app = self.clones[token]
+            bot_username = None
+            for username, cloned_app in list(self.clones_by_username.items()):
+                if cloned_app == app:
+                    bot_username = username
+                    break
+
+            try:
+                if app.updater and app.updater.running:
+                    await app.updater.stop()
+                await app.stop()
+                await app.shutdown()
+            except Exception as e:
+                logger.error(f"Error stopping clone {bot_username or token[:10]}: {e}")
+
+            if token in self.clones:
+                del self.clones[token]
+            if bot_username and bot_username in self.clones_by_username:
+                del self.clones_by_username[bot_username]
+            return True
+        return False
+
+    async def start_all(self):
+        if not self.db:
+            return
+        clones_in_db = self.db.get_all_clones()
+        logger.info(f"Starting {len(clones_in_db)} cloned bots from database...")
+        for clone in clones_in_db:
+            if clone.get("is_active", True):
+                token = clone["token"]
+                owner_id = clone["user_id"]
+                # Start clone in background so one failure doesn't block the rest
+                asyncio.create_task(self.start_clone(token, owner_id))
+
+    async def stop_all(self):
+        logger.info("Stopping all cloned bots...")
+        tokens = list(self.clones.keys())
+        for token in tokens:
+            await self.stop_clone(token)
+
+# --- Initialize Clone Manager ---
+clone_manager = None
+if mongo_manager is not None:
+    clone_manager = CloneManager(mongo_manager)
 
 # --- Core Game Logic Functions ---
 # (get_feedback and calculate_points remain unchanged)
@@ -229,7 +395,7 @@ def calculate_points(difficulty: str, guesses: int) -> int:
     bonus = max(0, 10 - (guesses - 1) * 2) 
     return base + bonus
 
-async def start_new_game_logic(chat_id: int, difficulty: str) -> Tuple[bool, str]:
+async def start_new_game_logic(chat_id: int, difficulty: str, bot_username: str) -> Tuple[bool, str]:
     if not mongo_manager: return False, "❌ *Database Error*. Game cannot be started without database access."
     
     difficulty = difficulty.lower()
@@ -254,21 +420,21 @@ async def start_new_game_logic(chat_id: int, difficulty: str) -> Tuple[bool, str
         'guess_history': [],
         'guessed_words': [] # NEW: To track unique words guessed
     }
-    mongo_manager.save_game_state(chat_id, initial_state)
+    mongo_manager.save_game_state(chat_id, initial_state, bot_username)
     
     return True, (
-        f"**✨ New Word Rush Challenge!**\n"
+        f"**✨ New Word Challenge!**\n"
         f"-------------------------------------\n"
         f"🎯 Difficulty: **{difficulty.capitalize()}**\n"
         f"📜 Word Length: **{length} letters** (Example: `{config['example']}`)\n"
         f"➡️ *Send your {length}-letter guess directly to the chat!*"
     )
 
-async def process_guess_logic(chat_id: int, guess: str) -> Tuple[str, bool, str, int, List[str]]:
+async def process_guess_logic(chat_id: int, guess: str, bot_username: str) -> Tuple[str, bool, str, int, List[str]]:
     """Processes a user's guess and returns feedback, win status, and points."""
     if not mongo_manager: return "", False, "Database Error.", 0, []
 
-    game = mongo_manager.get_game_state(chat_id)
+    game = mongo_manager.get_game_state(chat_id, bot_username)
     if not game:
         return "", False, "No active game.", 0, []
     
@@ -302,8 +468,7 @@ async def process_guess_logic(chat_id: int, guess: str) -> Tuple[str, bool, str,
     if guess_clean == secret_word:
         guesses = game['guesses_made']
         points = calculate_points(game['difficulty'], guesses)
-        game_word_for_loss = game['word']
-        mongo_manager.delete_game_state(chat_id) 
+        mongo_manager.delete_game_state(chat_id, bot_username)
         return feedback_str, True, "WIN", points, game['guess_history']
 
     # 5. Check for Loss
@@ -311,12 +476,12 @@ async def process_guess_logic(chat_id: int, guess: str) -> Tuple[str, bool, str,
     
     if remaining <= 0:
         game_word_for_loss = game['word']
-        mongo_manager.delete_game_state(chat_id) 
+        mongo_manager.delete_game_state(chat_id, bot_username)
         # For loss, we return the secret word as status
         return feedback_str, False, f"LOSS_WORD:{game_word_for_loss}", 0, game['guess_history']
     
     # Status for ongoing game
-    mongo_manager.save_game_state(chat_id, game)
+    mongo_manager.save_game_state(chat_id, game, bot_username)
     return feedback_str, False, f"Guesses left: **{remaining}**", 0, game['guess_history']
 
 # --- Telegram UI & Handler Functions (All Unchanged) ---
@@ -333,14 +498,29 @@ async def is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 # --- Keyboard Functions (Unchanged) ---
 
-def get_start_keyboard():
+async def get_bot_keyboard_links(bot_username: str) -> Tuple[str, str]:
+    """Returns (updates_channel_url, report_support_url) for the bot."""
+    channel_url = "https://t.me/narzob"
+    group_url = "https://t.me/Onlymrabhi01"
+    if mongo_manager:
+        clone = mongo_manager.get_clone_by_username(bot_username)
+        if clone:
+            channel_url = clone.get("custom_channel") or channel_url
+            group_url = clone.get("custom_group") or group_url
+    return channel_url, group_url
+
+def get_start_keyboard(bot_username: str, channel_url: str, group_url: str):
     keyboard = [
         [InlineKeyboardButton("❓ Help & Info", callback_data="show_help_menu")],
         [
-            InlineKeyboardButton("💬 Report Bugs", url="https://t.me/Onlymrabhi01"), 
-            InlineKeyboardButton("📢 Updates Channel", url="https://t.me/narzob") 
+            InlineKeyboardButton("💬 Report Bugs", url=group_url),
+            InlineKeyboardButton("📢 Updates Channel", url=channel_url)
         ],
-        [InlineKeyboardButton("➕ Add Bot to Group", url="https://t.me/narzowordseekbot?startgroup=true")]
+        [
+            InlineKeyboardButton("👥 Clone Bot", callback_data="clone_menu"),
+            InlineKeyboardButton("⚙️ Manage Clone", callback_data="manage_menu")
+        ],
+        [InlineKeyboardButton("➕ Add Bot to Group", url=f"https://t.me/{bot_username}?startgroup=true")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -418,40 +598,46 @@ async def display_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE
 # --- Command Handlers (All Unchanged) ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    bot_username = context.bot.username.lower()
+    chat_id = update.effective_chat.id
     if mongo_manager and update.effective_message:
-        mongo_manager.add_chat(update.effective_chat.id, update.effective_chat.type.name, update.effective_message.date.timestamp())
+        mongo_manager.add_chat(chat_id, update.effective_chat.type.name, update.effective_message.date.timestamp(), bot_username)
+
+    channel_url, group_url = await get_bot_keyboard_links(bot_username)
     
     # Stylish Start Message
     await update.message.reply_text(
-        "👋 *Hello! I'm* **@narzowordseekbot** 🤖\n"
-        "-------------------------------------\n"
-        "The **Ultimate Word Challenge** on Telegram!\n\n"
-        "📜 **Goal:** *Guess the secret word using hints (🟩/🟨/🟥).*\n"
-        "🏆 **Compete:** *Win to earn points and climb the Global Leaderboard!* 🌐\n\n"
-        "👉 Tap **/new** or the button below to start your rush!\n"
-        "-------------------------------------",
-        reply_markup=get_start_keyboard(),
+        f"👋 *Hello! I'm* **@{context.bot.username}** 🤖\n"
+        f"-------------------------------------\n"
+        f"The **Ultimate Word Challenge** on Telegram!\n\n"
+        f"📜 **Goal:** *Guess the secret word using hints (🟩/🟨/🟥).*\n"
+        f"🏆 **Compete:** *Win to earn points and climb the Global Leaderboard!* 🌐\n\n"
+        f"👉 Tap **/new** or the button below to start your challenge!\n"
+        f"-------------------------------------",
+        reply_markup=get_start_keyboard(context.bot.username, channel_url, group_url),
         parse_mode='Markdown'
     )
 
 async def new_game_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
+    bot_username = context.bot.username.lower()
     if mongo_manager and update.effective_message:
-        mongo_manager.add_chat(chat_id, update.effective_chat.type.name, update.effective_message.date.timestamp())
+        mongo_manager.add_chat(chat_id, update.effective_chat.type.name, update.effective_message.date.timestamp(), bot_username)
 
     difficulty = context.args[0].lower() if context.args else 'medium'
     
-    if mongo_manager and mongo_manager.get_game_state(chat_id):
+    if mongo_manager and mongo_manager.get_game_state(chat_id, bot_username):
         await update.message.reply_text("⏳ *A game is already active*. Use **/end** to stop it first.")
         return
 
-    success, message = await start_new_game_logic(chat_id, difficulty)
+    success, message = await start_new_game_logic(chat_id, difficulty, bot_username)
     await update.message.reply_text(message, parse_mode='Markdown')
 
 async def end_game_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
+    bot_username = context.bot.username.lower()
     
-    if not mongo_manager or not mongo_manager.get_game_state(chat_id):
+    if not mongo_manager or not mongo_manager.get_game_state(chat_id, bot_username):
         await update.message.reply_text("❌ *No game is currently running to end*.")
         return
         
@@ -459,9 +645,9 @@ async def end_game_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("🚨 *Admin Check Failed*. You must be an **Admin** to force-end the game.", parse_mode='Markdown')
         return
 
-    game_state = mongo_manager.get_game_state(chat_id)
+    game_state = mongo_manager.get_game_state(chat_id, bot_username)
     word = game_state.get('word', 'UNKNOWN')
-    mongo_manager.delete_game_state(chat_id)
+    mongo_manager.delete_game_state(chat_id, bot_username)
     
     await update.message.reply_text(
         f"🛑 **Game Ended!**\n"
@@ -472,11 +658,12 @@ async def end_game_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Shows the current game status and guess history."""
     chat_id = update.effective_chat.id
+    bot_username = context.bot.username.lower()
     if not mongo_manager:
         await update.message.reply_text("❌ *Database Error*. Cannot fetch game status.")
         return
 
-    game_state = mongo_manager.get_game_state(chat_id)
+    game_state = mongo_manager.get_game_state(chat_id, bot_username)
     if not game_state:
         await update.message.reply_text("🎯 *No active game*. Use **/new** to start a challenge!")
         return
@@ -491,7 +678,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     remaining = game_state['max_guesses'] - game_state['guesses_made']
     
     reply_text = (
-        f"**📊 Current Word Rush Status**\n"
+        f"**📊 Current Word Challenge Status**\n"
         f"-------------------------------------\n"
         f"Difficulty: **{game_state['difficulty'].capitalize()}**\n"
         f"Word Length: **{len(game_state['word'])} letters**\n"
@@ -505,8 +692,9 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Shows the leaderboard menu or the global leaderboard directly."""
+    bot_username = context.bot.username.lower()
     if mongo_manager and update.effective_message:
-        mongo_manager.add_chat(update.effective_chat.id, update.effective_chat.type.name, update.effective_message.date.timestamp())
+        mongo_manager.add_chat(update.effective_chat.id, update.effective_chat.type.name, update.effective_message.date.timestamp(), bot_username)
 
     # If arguments are provided (e.g., /leaderboard daily), show that specific one
     if context.args and context.args[0].lower() in ['daily', 'weekly', 'monthly', 'global']:
@@ -526,7 +714,7 @@ async def difficulty_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("🚨 *Admin Check Failed*. You must be an **Admin** to view or change settings.", parse_mode='Markdown')
         return
 
-    message = "**⚙️ Word Rush Difficulty Settings**\n"
+    message = "**⚙️ Word Challenge Difficulty Settings**\n"
     message += "-------------------------------------\n"
     
     for level, config in DIFFICULTY_CONFIG.items():
@@ -540,11 +728,111 @@ async def difficulty_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await update.message.reply_text(message, parse_mode='Markdown')
 
+async def clone_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data['awaiting_token'] = True
+    await update.message.reply_text(
+        "👥 **Clone Bot System** 🤖\n"
+        "-------------------------------------\n"
+        "Create your own Word Challenge game bot in seconds!\n\n"
+        "💡 **How to clone:**\n"
+        "1️⃣ Go to @BotFather and send `/newbot`.\n"
+        "2️⃣ Choose a Name and a Username for your bot.\n"
+        "3️⃣ Copy the **HTTP API Token** (e.g., `12345678:ABCDefGh...`).\n"
+        "4️⃣ **Send the token directly in the chat below!**\n\n"
+        "⚠️ *Note: Only 1 cloned bot is allowed per Telegram user.*",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Start", callback_data="back_to_start")]]),
+        parse_mode='Markdown'
+    )
 
-# --- Broadcast Command (Unchanged, Admin only) ---
+async def manage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not mongo_manager:
+        await update.message.reply_text("❌ Database error.")
+        return
+    clone = mongo_manager.get_clone_by_owner(user_id)
+    if not clone:
+        await update.message.reply_text(
+            "❌ **You do not have any active clone!**\n\n"
+            "Use `/clone` to create one.",
+            parse_mode='Markdown'
+        )
+        return
+
+    # Get custom links
+    channel = clone.get("custom_channel") or "None (Default)"
+    support = clone.get("custom_group") or "None (Default)"
+
+    await update.message.reply_text(
+        f"⚙️ **Manage Your Clone Bot**\n"
+        f"-------------------------------------\n"
+        f"🤖 **Bot Username:** @{clone['bot_username']}\n"
+        f"🟢 **Status:** Running\n"
+        f"📢 **Channel Link:** {channel}\n"
+        f"💬 **Support Link:** {support}\n\n"
+        f"Choose an action below to manage your bot:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 Broadcast Message", callback_data="manage_broadcast")],
+            [InlineKeyboardButton("🔗 Edit Channel Link", callback_data="manage_edit_channel"),
+             InlineKeyboardButton("💬 Edit Support Link", callback_data="manage_edit_support")],
+            [InlineKeyboardButton("🛑 Stop & Delete Clone", callback_data="manage_delete_clone")],
+            [InlineKeyboardButton("🔙 Back to Start", callback_data="back_to_start")]
+        ]),
+        parse_mode='Markdown'
+    )
+
+
+# --- Admin Panel and Broadcast Commands (Admin only) ---
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Main owner admin panel."""
+    if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("❌ You are not authorized to use this command.")
+        return
+
+    if not mongo_manager:
+        await update.message.reply_text("❌ Database not connected.")
+        return
+
+    clones = mongo_manager.get_all_clones()
+    active_clones = list(clone_manager.clones.values()) if clone_manager else []
+
+    # Check args
+    if context.args:
+        subcmd = context.args[0].lower()
+        if subcmd == "list":
+            msg = "📋 **List of Cloned Bots:**\n"
+            for c in clones:
+                msg += f"- @{c['bot_username']} (Owner ID: `{c['user_id']}`)\n"
+            await update.message.reply_text(msg, parse_mode='Markdown')
+            return
+        elif subcmd == "stop":
+            if len(context.args) < 2:
+                await update.message.reply_text("Usage: `/admin stop <bot_username>`", parse_mode='Markdown')
+                return
+            target = context.args[1].lower().replace("@", "")
+            clone = mongo_manager.get_clone_by_username(target)
+            if clone:
+                await clone_manager.stop_clone(clone['token'])
+                mongo_manager.delete_clone(clone['user_id'])
+                await update.message.reply_text(f"✅ Bot @{target} has been stopped and deleted.")
+            else:
+                await update.message.reply_text(f"❌ Bot @{target} not found in database.")
+            return
+
+    msg = (
+        "👑 **Word Challenge Admin Control Panel** 👑\n"
+        "-------------------------------------\n"
+        f"👥 Total Clones in DB: **{len(clones)}**\n"
+        f"🟢 Active Clones Running: **{len(active_clones)}**\n\n"
+        "Commands:\n"
+        "👉 `/admin list` - List all cloned bots\n"
+        "👉 `/admin stop <username>` - Stop and delete a cloned bot\n"
+        "👉 `/broadcast <message>` - Broadcast to ALL users on ALL cloned bots"
+    )
+    await update.message.reply_text(msg, parse_mode='Markdown')
 
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a message to all known chats (Admin only)."""
+    """Sends a message to all known chats across all cloned bots and main bot (Admin only)."""
     if update.effective_user.id != ADMIN_USER_ID:
         await update.message.reply_text("❌ You are not authorized to use this command.")
         return
@@ -558,58 +846,85 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     message_to_send = " ".join(context.args)
-    chat_ids = mongo_manager.get_all_chat_ids()
+    chats = mongo_manager.get_all_chats()
     
     success_count = 0
     fail_count = 0
     
-    await update.message.reply_text(f"📢 *Attempting to broadcast message to* **{len(chat_ids)}** *chats...*")
+    await update.message.reply_text(f"📢 *Attempting global cross-bot broadcast to* **{len(chats)}** *chats...*")
 
-    for chat_id in chat_ids:
+    main_bot_username = context.bot.username.lower()
+
+    for chat in chats:
+        chat_id = chat['chat_id']
+        target_bot_username = chat.get('bot_username', main_bot_username).lower()
+
+        # Determine which bot instance to use
+        bot_instance = None
+        if target_bot_username == main_bot_username:
+            bot_instance = context.bot
+        else:
+            # Look up in clone manager
+            clone_app = clone_manager.clones_by_username.get(target_bot_username) if clone_manager else None
+            if clone_app:
+                bot_instance = clone_app.bot
+
+        if not bot_instance:
+            logger.warning(f"No running bot instance found for broadcast to {chat_id} on @{target_bot_username}")
+            fail_count += 1
+            continue
+
         try:
-            await context.bot.send_message(chat_id=chat_id, text=message_to_send, parse_mode='Markdown')
+            await bot_instance.send_message(chat_id=chat_id, text=message_to_send, parse_mode='Markdown')
             success_count += 1
         except error.Forbidden:
-            logger.warning(f"Failed to send broadcast to chat {chat_id}: Bot blocked.")
+            logger.warning(f"Failed to send broadcast to chat {chat_id} via @{target_bot_username}: Bot blocked.")
             fail_count += 1
         except Exception as e:
-            logger.error(f"Failed to send broadcast to chat {chat_id}: {e}")
+            logger.error(f"Failed to send broadcast to chat {chat_id} via @{target_bot_username}: {e}")
             fail_count += 1
             
-    await update.message.reply_text(f"✅ **Broadcast Complete**\nSuccessful: **{success_count}**\nFailed: **{fail_count}**", parse_mode='Markdown')
+    await update.message.reply_text(
+        f"✅ **Global Broadcast Complete**\n"
+        f"Successful: **{success_count}**\n"
+        f"Failed: **{fail_count}**",
+        parse_mode='Markdown'
+    )
 
 # --- Callback Handler (Unchanged) ---
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer() 
     chat_id = query.message.chat_id
+    bot_username = context.bot.username.lower()
     
     if query.data == "back_to_start":
+        channel_url, group_url = await get_bot_keyboard_links(bot_username)
         await query.edit_message_text(
-            "👋 *Hello! I'm* **WordRush Bot** 🤖\n"
-            "-------------------------------------\n"
-            "The **Ultimate Word Challenge** on Telegram!\n\n"
-            "📜 **Goal:** *Guess the secret word using hints (🟩/🟨/🟥).*\n"
-            "🏆 **Compete:** *Win to earn points and climb the Global Leaderboard!* 🌐\n\n"
-            "👉 Tap **/new** or the button below to start your rush!\n"
-            "-------------------------------------",
-            reply_markup=get_start_keyboard(),
+            f"👋 *Hello! I'm* **@{context.bot.username}** 🤖\n"
+            f"-------------------------------------\n"
+            f"The **Ultimate Word Challenge** on Telegram!\n\n"
+            f"📜 **Goal:** *Guess the secret word using hints (🟩/🟨/🟥).*\n"
+            f"🏆 **Compete:** *Win to earn points and climb the Global Leaderboard!* 🌐\n\n"
+            f"👉 Tap **/new** or the button below to start your challenge!\n"
+            f"-------------------------------------",
+            reply_markup=get_start_keyboard(context.bot.username, channel_url, group_url),
             parse_mode='Markdown'
         )
     
     elif query.data == "show_help_menu":
         await query.edit_message_text(
-            "📖 **WordRush Help Center**\n"
+            "📖 **Word Challenge Help Center**\n"
             "-------------------------------------\n"
             "*Choose a topic below to get assistance.*\n"
-            "*For any issue, please ask in the Report group!*",
+            "*For any issue, please ask in the Support group!*",
             reply_markup=get_help_menu_keyboard(),
             parse_mode='Markdown'
         )
 
     elif query.data == "show_how_to_play":
         commands_list = (
-            "🤔 **How to Play Word Rush** ❓\n"
+            "🤔 **How to Play Word Challenge** ❓\n"
             "-------------------------------------\n"
             "1. **The Word:** *Guess a secret word*, length depends on difficulty (4, 5, or 8 letters).\n\n"
             "2. **The Hints (`Boxes - Word`):**\n"
@@ -622,13 +937,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     elif query.data == "show_commands":
         commands_list = (
-            "📘 **Word Rush Commands List**\n"
+            "📘 **Word Challenge Commands List**\n"
             "-------------------------------------\n"
             "• **/new** [difficulty] → *Start a game*.\n"
-            "• **/status** → *Show current game status and history* (New Feature!).\n"
+            "• **/status** → *Show current game status and history*.\n"
             "• **/leaderboard** [period] → *Show global/daily/weekly/monthly rankings*.\n"
             "• **/end** → *End current game* (Admin Only / DM).\n"
             "• **/difficulty** → *Show difficulty settings* (Admin Only / DM).\n"
+            "• **/clone** → *Clone this bot to your own bot*.\n"
+            "• **/manage** → *Manage your cloned bot settings*.\n"
         )
         await query.edit_message_text(commands_list, reply_markup=get_help_menu_keyboard(), parse_mode='Markdown')
         
@@ -656,15 +973,119 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif query.data.startswith("start_"):
         difficulty = query.data.split('_')[1]
         
-        if mongo_manager and mongo_manager.get_game_state(chat_id):
+        if mongo_manager and mongo_manager.get_game_state(chat_id, bot_username):
             await query.edit_message_text("⏳ *A game is already active*. Use **/end** to stop it first.")
             return
 
-        success, message = await start_new_game_logic(chat_id, difficulty)
+        success, message = await start_new_game_logic(chat_id, difficulty, bot_username)
         if success:
             await query.edit_message_text(message, parse_mode='Markdown')
         else:
             await query.edit_message_text(f"❌ *Game start failed*: {message}", parse_mode='Markdown')
+
+    elif query.data == "clone_menu":
+        context.user_data['awaiting_token'] = True
+        await query.edit_message_text(
+            "👥 **Clone Bot System** 🤖\n"
+            "-------------------------------------\n"
+            "Create your own Word Challenge game bot in seconds!\n\n"
+            "💡 **How to clone:**\n"
+            "1️⃣ Go to @BotFather and send `/newbot`.\n"
+            "2️⃣ Choose a Name and a Username for your bot.\n"
+            "3️⃣ Copy the **HTTP API Token** (e.g., `12345678:ABCDefGh...`).\n"
+            "4️⃣ **Send the token directly in the chat below!**\n\n"
+            "⚠️ *Note: Only 1 cloned bot is allowed per Telegram user.*",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Start", callback_data="back_to_start")]]),
+            parse_mode='Markdown'
+        )
+
+    elif query.data == "manage_menu":
+        if not mongo_manager:
+            await query.answer("❌ Database error.")
+            return
+        clone = mongo_manager.get_clone_by_owner(query.from_user.id)
+        if not clone:
+            await query.edit_message_text(
+                "❌ **You do not have any active clone!**\n\n"
+                "Tap '👥 Clone Bot' in the main menu or send `/clone` to create one.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("👥 Clone Bot", callback_data="clone_menu")],
+                    [InlineKeyboardButton("🔙 Back to Start", callback_data="back_to_start")]
+                ]),
+                parse_mode='Markdown'
+            )
+            return
+
+        channel = clone.get("custom_channel") or "None (Default)"
+        support = clone.get("custom_group") or "None (Default)"
+
+        await query.edit_message_text(
+            f"⚙️ **Manage Your Clone Bot**\n"
+            f"-------------------------------------\n"
+            f"🤖 **Bot Username:** @{clone['bot_username']}\n"
+            f"🟢 **Status:** Running\n"
+            f"📢 **Channel Link:** {channel}\n"
+            f"💬 **Support Link:** {support}\n\n"
+            f"Choose an action below to manage your bot:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📢 Broadcast Message", callback_data="manage_broadcast")],
+                [InlineKeyboardButton("🔗 Edit Channel Link", callback_data="manage_edit_channel"),
+                 InlineKeyboardButton("💬 Edit Support Link", callback_data="manage_edit_support")],
+                [InlineKeyboardButton("🛑 Stop & Delete Clone", callback_data="manage_delete_clone")],
+                [InlineKeyboardButton("🔙 Back to Start", callback_data="back_to_start")]
+            ]),
+            parse_mode='Markdown'
+        )
+
+    elif query.data == "manage_broadcast":
+        context.user_data['awaiting_broadcast'] = True
+        await query.edit_message_text(
+            "📢 **Clone Broadcast**\n"
+            "-------------------------------------\n"
+            "Please send the message you want to broadcast to all users of your cloned bot.\n\n"
+            "👉 *Send the message text directly in this chat!*",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Manage", callback_data="manage_menu")]]),
+            parse_mode='Markdown'
+        )
+
+    elif query.data == "manage_edit_channel":
+        context.user_data['awaiting_channel'] = True
+        await query.edit_message_text(
+            "🔗 **Set Custom Updates Channel**\n"
+            "-------------------------------------\n"
+            "Please send your custom Telegram channel link (e.g., `https://t.me/mychannel`).\n\n"
+            "👉 *Send the link directly in this chat!*",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Manage", callback_data="manage_menu")]]),
+            parse_mode='Markdown'
+        )
+
+    elif query.data == "manage_edit_support":
+        context.user_data['awaiting_support'] = True
+        await query.edit_message_text(
+            "💬 **Set Custom Support Group**\n"
+            "-------------------------------------\n"
+            "Please send your custom Telegram support/chat group link (e.g., `https://t.me/mygroup`).\n\n"
+            "👉 *Send the link directly in this chat!*",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Manage", callback_data="manage_menu")]]),
+            parse_mode='Markdown'
+        )
+
+    elif query.data == "manage_delete_clone":
+        if not mongo_manager: return
+        clone = mongo_manager.get_clone_by_owner(query.from_user.id)
+        if clone:
+            await clone_manager.stop_clone(clone['token'])
+            mongo_manager.delete_clone(query.from_user.id)
+            await query.edit_message_text(
+                "🛑 **Clone Bot Stopped & Deleted**\n"
+                "-------------------------------------\n"
+                "Your clone bot has been successfully stopped and deleted from our servers.\n\n"
+                "You can create a new clone anytime!",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Start", callback_data="back_to_start")]]),
+                parse_mode='Markdown'
+            )
+        else:
+            await query.answer("❌ No clone bot found.")
 
 # --- Updated Guess Handler (Handles the new error message) ---
 
@@ -672,6 +1093,7 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     chat_id = update.effective_chat.id
     user = update.effective_user
     guess = update.message.text.strip()
+    bot_username = context.bot.username.lower()
     
     username = user.username or user.first_name
     logger.info(f"Guess received in chat {chat_id} from {username}: {guess}")
@@ -679,12 +1101,12 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not mongo_manager:
         return
 
-    game_state = mongo_manager.get_game_state(chat_id)
+    game_state = mongo_manager.get_game_state(chat_id, bot_username)
     if not game_state:
         return 
 
     # Process guess
-    feedback, is_win, status_message, points, guess_history = await process_guess_logic(chat_id, guess)
+    feedback, is_win, status_message, points, guess_history = await process_guess_logic(chat_id, guess, bot_username)
     
     # 1. Handle validation errors (Incorrect length OR Duplicate guess)
     if status_message.startswith("❌"):
@@ -733,7 +1155,7 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # Ongoing game message (Show full history + status)
         
         reply_text = (
-            f"**Word Rush Challenge** 🎯\n"
+            f"**Word Challenge** 🎯\n"
             f"-------------------------------------\n"
             f"Attempts: **`{len(guess_history)}`** / **`{game_state['max_guesses']}`**\n\n"
             f"📜 **Guess History:**\n"
@@ -747,23 +1169,121 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         parse_mode='Markdown'
     )
 
-# --- Main Bot Runner ---
+# --- Integrated Message Router ---
 
-def main():
-    """Start the bot."""
-    if not BOT_TOKEN:
-        logger.error("FATAL ERROR: BOT_TOKEN not found. Please set it in the .env file.")
-        return
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    bot_username = context.bot.username.lower()
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    text = update.message.text.strip() if update.message and update.message.text else ""
     
-    application = Application.builder().token(BOT_TOKEN).build()
+    if not text:
+        return
 
-    # Register Handlers
+    if mongo_manager:
+        mongo_manager.add_chat(chat_id, update.effective_chat.type.name, update.message.date.timestamp(), bot_username)
+
+    # 1. State: Awaiting Bot Token for Clone
+    if context.user_data.get('awaiting_token'):
+        context.user_data['awaiting_token'] = False
+        await update.message.reply_text("⏳ *Validating and starting your clone bot... please wait*", parse_mode='Markdown')
+        success, res = await clone_manager.start_clone(text, user.id)
+        if success:
+            mongo_manager.save_clone(user.id, user.username or user.first_name, text, res)
+            await update.message.reply_text(
+                f"🎉 **Bot Cloned Successfully!**\n\n"
+                f"🔗 Your bot is now active at: @{res}\n"
+                f"👉 Use `/manage` in the main bot to manage your clone and run broadcasts!",
+                parse_mode='Markdown'
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ **Failed to Clone Bot**\n\n"
+                f"Error: `{res}`\n\n"
+                f"Please ensure you copied the exact HTTP API Token from @BotFather and try again.",
+                parse_mode='Markdown'
+            )
+        return
+
+    # 2. State: Awaiting Clone Broadcast message
+    if context.user_data.get('awaiting_broadcast'):
+        context.user_data['awaiting_broadcast'] = False
+        await update.message.reply_text("📢 *Sending broadcast to all your clone's users...*", parse_mode='Markdown')
+
+        clone = mongo_manager.get_clone_by_owner(user.id)
+        if not clone:
+            await update.message.reply_text("❌ Clone bot not found.")
+            return
+
+        clone_bot_username = clone['bot_username']
+        chats = mongo_manager.get_all_chats(clone_bot_username)
+
+        # Get the clone bot application
+        clone_app = clone_manager.clones_by_username.get(clone_bot_username)
+        if not clone_app:
+            await update.message.reply_text("❌ Clone bot application is not currently running. Start it first.")
+            return
+
+        success_count = 0
+        fail_count = 0
+
+        for chat in chats:
+            try:
+                await clone_app.bot.send_message(chat_id=chat['chat_id'], text=text, parse_mode='Markdown')
+                success_count += 1
+            except Exception:
+                fail_count += 1
+
+        await update.message.reply_text(
+            f"✅ **Broadcast Complete**\n"
+            f"Successful: **{success_count}**\n"
+            f"Failed: **{fail_count}**",
+            parse_mode='Markdown'
+        )
+        return
+
+    # 3. State: Awaiting Custom Channel Link
+    if context.user_data.get('awaiting_channel'):
+        context.user_data['awaiting_channel'] = False
+        if not (text.startswith("https://t.me/") or text.startswith("http://t.me/")):
+            await update.message.reply_text("❌ *Invalid URL*. Must start with `https://t.me/`", parse_mode='Markdown')
+            return
+        mongo_manager.update_clone_links(user.id, custom_channel=text)
+        await update.message.reply_text(f"✅ **Custom channel link updated to:** {text}", parse_mode='Markdown')
+        return
+
+    # 4. State: Awaiting Custom Support Link
+    if context.user_data.get('awaiting_support'):
+        context.user_data['awaiting_support'] = False
+        if not (text.startswith("https://t.me/") or text.startswith("http://t.me/")):
+            await update.message.reply_text("❌ *Invalid URL*. Must start with `https://t.me/`", parse_mode='Markdown')
+            return
+        mongo_manager.update_clone_links(user.id, custom_group=text)
+        await update.message.reply_text(f"✅ **Custom support link updated to:** {text}", parse_mode='Markdown')
+        return
+
+    # 5. Check if guess (1-8 alphabetic characters) and there's an active game
+    if re.match(r'^[a-zA-Z]{1,8}$', text):
+        if mongo_manager and mongo_manager.get_game_state(chat_id, bot_username):
+            await handle_guess(update, context)
+            return
+
+    # If in private chat, show friendly command help
+    if update.effective_chat.type == ChatType.PRIVATE:
+        await update.message.reply_text("❓ *Command not recognized*. Use `/start` to see the main menu.", parse_mode='Markdown')
+
+# --- Unified Handler Registration & Lifecycle Hooks ---
+
+def register_all_handlers(application: Application):
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("new", new_game_command))
     application.add_handler(CommandHandler("end", end_game_command))
     application.add_handler(CommandHandler("leaderboard", leaderboard_command))
     application.add_handler(CommandHandler("difficulty", difficulty_command)) 
     application.add_handler(CommandHandler("status", status_command)) 
+    application.add_handler(CommandHandler("clone", clone_command))
+    application.add_handler(CommandHandler("manage", manage_command))
+    application.add_handler(CommandHandler("admin", admin_command))
     
     if ADMIN_USER_ID != 0 and mongo_manager is not None:
         application.add_handler(CommandHandler("broadcast", broadcast_command))
@@ -773,15 +1293,34 @@ def main():
     # Callback query handler for inline buttons
     application.add_handler(CallbackQueryHandler(callback_handler))
     
-    # Message handler for guesses:
+    # Message handler for guesses and multi-step state text inputs:
     application.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.Regex(r'^[a-zA-Z]{1,8}$'), 
-            handle_guess
+            filters.TEXT & ~filters.COMMAND,
+            handle_message
         )
     )
 
-    logger.info("🚀 WordRush Bot is running (Guess Uniqueness & Leaderboards Ready)...")
+async def post_init(application: Application) -> None:
+    if clone_manager:
+        asyncio.create_task(clone_manager.start_all())
+
+async def post_shutdown(application: Application) -> None:
+    if clone_manager:
+        await clone_manager.stop_all()
+
+# --- Main Bot Runner ---
+
+def main():
+    """Start the bot."""
+    if not BOT_TOKEN:
+        logger.error("FATAL ERROR: BOT_TOKEN not found. Please set it in the .env file.")
+        return
+
+    application = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
+    register_all_handlers(application)
+
+    logger.info("🚀 Word Challenge Bot is running (Clone Engine & Leaderboards Ready)...")
     
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
