@@ -292,7 +292,6 @@ class CloneManager:
         # 2. Create Application
         try:
             builder = Application.builder().token(token)
-            builder.signals(None) # Disable signal handling for clones to avoid conflict with main process
             app = builder.build()
 
             # Register handlers to the clone app
